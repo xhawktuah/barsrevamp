@@ -1,511 +1,464 @@
 -- StatsHUD.local.lua
--- Place this LocalScript in StarterGui (or StarterPlayerScripts) to auto-create the HUD for each player.
--- Features:
---  - Bottom-left modern HUD with 5 stat boxes (Health, Armor, Hunger, Thirst, Stamina)
---  - Smooth value tweening, glow, gradients, UIStroke (ApplyStrokeMode = Border)
---  - Demo bindings: H = damage health, J = damage armor, K = reduce hunger, L = reduce thirst
---  - Hold LeftShift to drain stamina; release to regen after 2s
---  - Public API functions: setHealth, setArmor, setHunger, setThirst, setStamina
+-- Revised HUD per request:
+--  - Removed demo bindings and removed Armor/Thirst (only Health, Stamina, Hunger remain)
+--  - Smaller boxes by default; box size is editable via SetBoxSize(px)
+--  - Stamina only drains while sprinting (use SprintStart/SprintStop). Walking does not drain stamina.
+--  - Stamina regen delay and rate are editable via SetRates
+--  - Health dies when it reaches 0 (sets Humanoid.Health = 0) and regenerates over time if not damaged; regen delay and rate are editable.
+--  - Hunger only regenerates when consumeFood(amount) is called.
+--  - Smooth downward-depleting fills implemented (Fill frames anchored to bottom). Tweens animate size smoothly.
+--  - Public API via BindableFunction StatsAPICall: actions include Set, Damage, ConsumeFood, SprintStart/Stop, SetBoxSize, SetRates.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Config
+-- CONFIG (editable)
 local HUD_NAME = "StatsHUD"
-local MAIN_FRAME_SIZE = UDim2.new(0, 320, 0, 50)
 local MAIN_FRAME_POSITION = UDim2.new(0.02, 0, 0.98, 0)
 local MAIN_FRAME_ANCHOR = Vector2.new(0, 1)
-local BOX_SIZE = UDim2.new(0, 50, 0, 50)
+local BOX_PIXEL_SIZE = 44 -- default; editable via SetBoxSize(px)
 local BOX_BG_COLOR = Color3.fromRGB(28, 28, 32)
 local BOX_BG_TRANSPARENCY = 0.2
 local UICORNER_RADIUS = 6
+local SPACING = 8
+local PADDING = 4
+local VALUE_LABEL_HEIGHT = 14
 
--- Stat definitions (left to right)
-local StatDefs = {
-	{ key = "Health",  icon = "❤️", color = Color3.fromRGB(255,70,70), max = 100 },
-	{ key = "Armor",   icon = "🛡️", color = Color3.fromRGB(70,170,255), max = 100 },
-	{ key = "Hunger",  icon = "🍗", color = Color3.fromRGB(255,200,60), max = 100 },
-	{ key = "Thirst",  icon = "💧", color = Color3.fromRGB(255,165,0), max = 100 }, -- thirst uses orange tint for RP taste
-	{ key = "Stamina", icon = "💧", color = Color3.fromRGB(60,255,170), max = 100 }, -- stamina green droplet
+-- Stamina settings (editable at runtime via API)
+local stamina = {
+    Max = 100,
+    DrainRate = 20, -- per second when sprinting
+    RegenRate = 18, -- per second when not sprinting
+    RegenDelay = 2, -- seconds after stop sprinting before regen begins
 }
 
--- State & UI tables
-local Stats = {}
+-- Health settings
+local healthSettings = {
+    Max = 100,
+    RegenRate = 6, -- per second when not recently damaged
+    RegenDelay = 4, -- seconds after last damage before regen begins
+}
+
+-- Hunger settings
+local hungerSettings = {
+    Max = 100,
+    -- No auto regeneration; only via ConsumeFood
+}
+
+-- Internal state
+local Stats = {} -- will hold Health, Stamina, Hunger data
 local UI = {}
-
--- Helper to create instances succinctly
-local function new(className, props)
-	local inst = Instance.new(className)
-	if props then
-		for k,v in pairs(props) do
-			inst[k] = v
-		end
-	end
-	return inst
-end
-
--- Create main HUD frame
-local screenGui = new("ScreenGui", {
-	Name = HUD_NAME,
-	Parent = playerGui,
-	DisplayOrder = 1000,
-	ResetOnSpawn = false,
-})
-
-local mainFrame = new("Frame", {
-	Name = "Main",
-	Parent = screenGui,
-	AnchorPoint = MAIN_FRAME_ANCHOR,
-	Position = MAIN_FRAME_POSITION,
-	Size = MAIN_FRAME_SIZE,
-	BackgroundTransparency = 1,
-	ZIndex = 2,
-})
-
--- Container for stat boxes
-local container = new("Frame", {
-	Name = "Container",
-	Parent = mainFrame,
-	AnchorPoint = Vector2.new(0,0),
-	Position = UDim2.new(0,0,0,0),
-	Size = UDim2.new(1,1,1,0),
-	BackgroundTransparency = 1,
-})
--- Padding and layout
-local padding = new("UIPadding", {
-	Parent = container,
-	PaddingLeft = UDim.new(0, 4),
-	PaddingRight = UDim.new(0, 4),
-	PaddingTop = UDim.new(0, 0),
-	PaddingBottom = UDim.new(0, 0),
-})
-local layout = new("UIListLayout", {
-	Parent = container,
-	FillDirection = Enum.FillDirection.Horizontal,
-	HorizontalAlignment = Enum.HorizontalAlignment.Left,
-	SortOrder = Enum.SortOrder.LayoutOrder,
-	VerticalAlignment = Enum.VerticalAlignment.Center,
-	Padding = UDim.new(0, 8),
-})
-container:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() end)
-
--- Helper: creates a stat box (returns table with references)
-local function createStatBox(def, order)
-	local box = new("Frame", {
-		Name = def.key .. "Box",
-		Parent = container,
-		Size = BOX_SIZE,
-		BackgroundColor3 = BOX_BG_COLOR,
-		BackgroundTransparency = BOX_BG_TRANSPARENCY,
-		LayoutOrder = order,
-		ClipsDescendants = false,
-	})
-	-- Corner
-	local corner = new("UICorner", { Parent = box, CornerRadius = UDim.new(0, UICORNER_RADIUS) })
-	-- Stroke with ApplyStrokeMode = Border
-	local stroke = new("UIStroke", {
-		Parent = box,
-		Thickness = 2,
-		Color = def.color,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-	})
-	-- Subtle gradient
-	local gradient = new("UIGradient", {
-		Parent = box,
-		Color = ColorSequence.new{
-			ColorSequenceKeypoint.new(0, Color3.fromRGB(40,40,44)),
-			ColorSequenceKeypoint.new(1, BOX_BG_COLOR),
-		},
-		Rotation = 90,
-	})
-
-	-- Glow: a slightly transparent duplicate frame behind the box content that will be used for soft glow
-	local glow = new("Frame", {
-		Name = "Glow",
-		Parent = box,
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.5, 0),
-		Size = UDim2.new(0, 42, 0, 42),
-		BackgroundColor3 = def.color,
-		BackgroundTransparency = 0.85,
-		ZIndex = 1,
-	})
-	new("UICorner", { Parent = glow, CornerRadius = UDim.new(0, UICORNER_RADIUS) })
-
-	-- Icon (using emoji/text for simplicity)
-	local icon = new("TextLabel", {
-		Name = "Icon",
-		Parent = box,
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.4, 0),
-		Size = UDim2.new(0, 24, 0, 24),
-		BackgroundTransparency = 1,
-		Text = def.icon,
-		TextColor3 = Color3.new(1,1,1),
-		Font = Enum.Font.GothamBold,
-		TextSize = 20,
-		ZIndex = 3,
-	})
-	-- Soft duplicate for glow behind icon
-	local iconGlow = new("TextLabel", {
-		Name = "IconGlow",
-		Parent = box,
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.4, 0),
-		Size = UDim2.new(0, 34, 0, 34),
-		BackgroundTransparency = 1,
-		Text = def.icon,
-		TextColor3 = def.color,
-		Font = Enum.Font.GothamBold,
-		TextSize = 28,
-		TextTransparency = 0.85,
-		ZIndex = 2,
-	})
-	-- Value label under the icon
-	local valueLabel = new("TextLabel", {
-		Name = "Value",
-		Parent = box,
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 1, 2),
-		Size = UDim2.new(0, 60, 0, 14),
-		BackgroundTransparency = 1,
-		Text = "100",
-		TextColor3 = Color3.new(1,1,1),
-		TextStrokeTransparency = 0.5,
-		Font = Enum.Font.GothamBold,
-		TextSize = 12,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		ZIndex = 3,
-	})
-
-	-- Put some accessibility attributes
-	box:SetAttribute("Stat", def.key)
-
-	return {
-		Box = box,
-		Corner = corner,
-		Stroke = stroke,
-		Gradient = gradient,
-		Glow = glow,
-		Icon = icon,
-		IconGlow = iconGlow,
-		ValueLabel = valueLabel,
-		Def = def,
-	}
-end
-
--- Create the stat boxes and associated NumberValues for smooth tweening
-for i,def in ipairs(StatDefs) do
-	local ui = createStatBox(def, i)
-	UI[def.key] = ui
-
-	-- NumberValue to store current displayed value (so we can tween it)
-	local nv = new("NumberValue", {
-		Name = def.key .. "Value",
-		Value = def.max,
-		Parent = ui.Box,
-	})
-	Stats[def.key] = {
-		Value = def.max,
-		Max = def.max,
-		NV = nv,
-		UI = ui,
-	}
-	-- Initialize label
-	ui.ValueLabel.Text = tostring(math.floor(nv.Value))
-end
-
--- Helper to tween numeric stat values smoothly
-local function tweenStatTo(key, newValue, duration)
-	duration = duration or 0.35
-	local stat = Stats[key]
-	if not stat then return end
-	newValue = math.clamp(newValue, 0, stat.Max)
-	local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local tween = TweenService:Create(stat.NV, tweenInfo, { Value = newValue })
-	tween:Play()
-	-- While tweening, update label on NV change
-	local conn
-	conn = stat.NV.Changed:Connect(function()
-		local display = math.floor(stat.NV.Value + 0.5)
-		stat.UI.ValueLabel.Text = tostring(display)
-	end)
-	tween.Completed:Connect(function()
-		if conn then conn:Disconnect() end
-		stat.Value = newValue
-		stat.NV.Value = newValue
-		stat.UI.ValueLabel.Text = tostring(math.floor(newValue))
-	end)
-end
-
--- Public setter functions
-local function setHealth(v) tweenStatTo("Health", v) end
-local function setArmor(v)  tweenStatTo("Armor", v)  end
-local function setHunger(v) tweenStatTo("Hunger", v) end
-local function setThirst(v) tweenStatTo("Thirst", v) end
-local function setStamina(v) tweenStatTo("Stamina", v) end
-
--- Helper visual responses
-
--- Health low: flash red overlay + heartbeat effect
-local function handleHealthVisual()
-	local stat = Stats.Health
-	local ui = stat.UI
-	local lowThreshold = stat.Max * 0.2
-	-- Create overlay if not present
-	if not ui.Box:FindFirstChild("LowOverlay") then
-		local overlay = new("Frame", {
-			Name = "LowOverlay",
-			Parent = ui.Box,
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.new(0.5, 0.5, 0, 0),
-			Size = UDim2.new(1, 0, 1, 0),
-			BackgroundColor3 = Color3.fromRGB(255,0,0),
-			BackgroundTransparency = 1,
-			ZIndex = 4,
-		})
-		new("UICorner", { Parent = overlay, CornerRadius = UDim.new(0, UICORNER_RADIUS) })
-	end
-	local overlay = ui.Box:FindFirstChild("LowOverlay")
-	if stat.Value <= lowThreshold then
-		-- start heartbeat (scale pulse) and red flash overlay
-		TweenService:Create(overlay, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 0.85 }):Play()
-		-- heartbeat: pulse icon glow
-		local pulse = TweenService:Create(ui.IconGlow, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { TextTransparency = 0.6 })
-		pulse:Play()
-		ui.HeartbeatTween = pulse
-	else
-		-- stop heartbeat and hide overlay
-		if ui.HeartbeatTween then
-			ui.HeartbeatTween:Cancel()
-			ui.IconGlow.TextTransparency = 0.85
-			ui.HeartbeatTween = nil
-		end
-		TweenService:Create(overlay, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 1 }):Play()
-	end
-end
-
--- Armor damage flash and break effect
-local function flashArmorDamage(amount)
-	local stat = Stats.Armor
-	local ui = stat.UI
-	-- Quick blue flash on the stroke and glow
-	local origColor = ui.Stroke.Color
-	local flashTween = TweenService:Create(ui.Stroke, TweenInfo.new(0.12), { Color = Color3.fromRGB(160, 200, 255) })
-	local restoreTween = TweenService:Create(ui.Stroke, TweenInfo.new(0.4), { Color = stat.Def.color })
-	flashTween:Play()
-	flashTween.Completed:Wait()
-	restoreTween:Play()
-	-- If armor is 0, create break effect
-	if stat.Value <= 0 then
-		-- Small radial fade effect: clone glow and expand
-		local frag = ui.Glow:Clone()
-		frag.Name = "ArmorBreak"
-		frag.Parent = ui.Box
-		frag.Size = UDim2.new(0, 10, 0, 10)
-		frag.BackgroundTransparency = 0.6
-		frag.ZIndex = 1
-		local breakTween = TweenService:Create(frag, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = UDim2.new(0, 90, 0, 90), BackgroundTransparency = 1 })
-		breakTween:Play()
-		breakTween.Completed:Connect(function() frag:Destroy() end)
-	end
-end
-
--- Stamina drain/regenerate logic
-local staminaDraining = false
+local sprinting = false
 local staminaRegenScheduled = false
-local staminaRegenDelay = 2 -- seconds
-local staminaDrainRate = 20  -- per second
-local staminaRegenRate = 18  -- per second
+local lastDamageTime = 0
 
-local function startStaminaDrain()
-	if staminaDraining then return end
-	staminaDraining = true
-	staminaRegenScheduled = false
-	-- drain while Shift held
-	local last = tick()
-	local conn
-	conn = RunService.Heartbeat:Connect(function()
-		if not staminaDraining then
-			conn:Disconnect()
-			return
-		end
-		local now = tick()
-		local dt = now - last
-		last = now
-		local stat = Stats.Stamina
-		local newv = math.max(0, stat.Value - staminaDrainRate * dt)
-		tweenStatTo("Stamina", newv, 0.12)
-		-- low color change
-		if newv <= stat.Max * 0.15 then
-			-- flash orange tint
-			stat.UI.Stroke.Color = Color3.fromRGB(255,165,0)
-			stat.UI.IconGlow.TextColor3 = Color3.fromRGB(255,165,0)
-		end
-		if newv <= 0 then
-			-- empty flashes
-			-- blink the value label
-			local blinkTween = TweenService:Create(stat.UI.ValueLabel, TweenInfo.new(0.35, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { TextTransparency = 0.6 })
-			blinkTween:Play()
-			stat.UI.EmptyBlink = blinkTween
-		end
-	end)
+-- Utility to create Instances
+local function new(className, props)
+    local inst = Instance.new(className)
+    if props then
+        for k,v in pairs(props) do inst[k] = v end
+    end
+    return inst
 end
 
-local function scheduleStaminaRegen()
-	if staminaRegenScheduled then return end
-	staminaRegenScheduled = true
-	delay(staminaRegenDelay, function()
-		staminaDraining = false
-		-- stop any empty blink
-		local stat = Stats.Stamina
-		if stat.UI.EmptyBlink then
-			stat.UI.EmptyBlink:Cancel()
-			stat.UI.ValueLabel.TextTransparency = 0
-			stat.UI.EmptyBlink = nil
-		end
-		-- regen loop
-		local last = tick()
-		local conn
-		conn = RunService.Heartbeat:Connect(function()
-			-- stop if we started draining again
-			if staminaDraining then
-				conn:Disconnect()
-				return
-			end
-			local now = tick()
-			local dt = now - last
-			last = now
-			local stat = Stats.Stamina
-			if stat.Value >= stat.Max then
-				-- restore stroke color
-				stat.UI.Stroke.Color = stat.Def.color
-				stat.UI.IconGlow.TextColor3 = stat.Def.color
-				conn:Disconnect()
-				return
-			end
-			local newv = math.min(stat.Max, stat.Value + staminaRegenRate * dt)
-			tweenStatTo("Stamina", newv, 0.15)
-			-- while regening, restore color gradually
-			stat.UI.Stroke.Color = stat.Def.color:Lerp(Color3.fromRGB(255,165,0), 0.5)
-		end)
-		staminaRegenScheduled = false
-	end)
+-- Build or rebuild the HUD
+local function buildHUD()
+    -- Remove existing if present
+    local existing = playerGui:FindFirstChild(HUD_NAME)
+    if existing then existing:Destroy() end
+
+    local screenGui = new("ScreenGui", {
+        Name = HUD_NAME,
+        Parent = playerGui,
+        DisplayOrder = 1000,
+        ResetOnSpawn = false,
+    })
+
+    -- compute sizes
+    local statCount = 3 -- Health, Hunger, Stamina
+    local totalWidth = PADDING*2 + statCount * BOX_PIXEL_SIZE + (statCount - 1) * SPACING
+    local totalHeight = BOX_PIXEL_SIZE + VALUE_LABEL_HEIGHT + 6
+
+    local mainFrame = new("Frame", {
+        Name = "Main",
+        Parent = screenGui,
+        AnchorPoint = MAIN_FRAME_ANCHOR,
+        Position = MAIN_FRAME_POSITION,
+        Size = UDim2.new(0, totalWidth, 0, totalHeight),
+        BackgroundTransparency = 1,
+        ZIndex = 2,
+    })
+
+    local container = new("Frame", {
+        Name = "Container",
+        Parent = mainFrame,
+        AnchorPoint = Vector2.new(0,0),
+        Position = UDim2.new(0,0,0,0),
+        Size = UDim2.new(1,1,1,0),
+        BackgroundTransparency = 1,
+    })
+    local paddingInst = new("UIPadding", { Parent = container, PaddingLeft = UDim.new(0,PADDING), PaddingRight = UDim.new(0,PADDING) })
+    local layout = new("UIListLayout", {
+        Parent = container,
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Left,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        VerticalAlignment = Enum.VerticalAlignment.Top,
+        Padding = UDim.new(0, SPACING),
+    })
+
+    -- Stat definitions in order: Health, Hunger, Stamina
+    local defs = {
+        { key = "Health",  icon = "❤️", color = Color3.fromRGB(255,70,70), max = healthSettings.Max },
+        { key = "Hunger",  icon = "🍗", color = Color3.fromRGB(255,200,60), max = hungerSettings.Max },
+        { key = "Stamina", icon = "💧", color = Color3.fromRGB(60,255,170), max = stamina.Max },
+    }
+
+    -- create boxes
+    for i,def in ipairs(defs) do
+        local box = new("Frame", {
+            Name = def.key .. "Box",
+            Parent = container,
+            Size = UDim2.new(0, BOX_PIXEL_SIZE, 0, BOX_PIXEL_SIZE),
+            BackgroundColor3 = BOX_BG_COLOR,
+            BackgroundTransparency = BOX_BG_TRANSPARENCY,
+            LayoutOrder = i,
+            ClipsDescendants = true,
+        })
+        new("UICorner", { Parent = box, CornerRadius = UDim.new(0, UICORNER_RADIUS) })
+        local stroke = new("UIStroke", { Parent = box, Thickness = 2, Color = def.color, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+        new("UIGradient", { Parent = box, Color = ColorSequence.new{ ColorSequenceKeypoint.new(0, Color3.fromRGB(40,40,44)), ColorSequenceKeypoint.new(1, BOX_BG_COLOR) }, Rotation = 90 })
+
+        -- Fill frame anchored to bottom: height represents proportion (1.0 = full)
+        local fill = new("Frame", {
+            Name = "Fill",
+            Parent = box,
+            AnchorPoint = Vector2.new(0,1),
+            Position = UDim2.new(0,1,0,0), -- bottom-left
+            Size = UDim2.new(1,0,1,0), -- full initially
+            BackgroundColor3 = def.color,
+            BackgroundTransparency = 0.85,
+            ZIndex = 1,
+        })
+        new("UICorner", { Parent = fill, CornerRadius = UDim.new(0, UICORNER_RADIUS) })
+
+        -- Icon and glow on top
+        local iconGlow = new("TextLabel", {
+            Name = "IconGlow",
+            Parent = box,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0.5, 0, 0.42, 0),
+            Size = UDim2.new(0, BOX_PIXEL_SIZE * 0.6, 0, BOX_PIXEL_SIZE * 0.6),
+            BackgroundTransparency = 1,
+            Text = def.icon,
+            TextColor3 = def.color,
+            Font = Enum.Font.GothamBold,
+            TextSize = math.clamp(BOX_PIXEL_SIZE * 0.5, 12, 28),
+            TextTransparency = 0.9,
+            ZIndex = 2,
+        })
+
+        local icon = new("TextLabel", {
+            Name = "Icon",
+            Parent = box,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0.5, 0, 0.42, 0),
+            Size = UDim2.new(0, BOX_PIXEL_SIZE * 0.5, 0, BOX_PIXEL_SIZE * 0.5),
+            BackgroundTransparency = 1,
+            Text = def.icon,
+            TextColor3 = Color3.new(1,1,1),
+            Font = Enum.Font.GothamBold,
+            TextSize = math.clamp(BOX_PIXEL_SIZE * 0.45, 10, 24),
+            ZIndex = 3,
+        })
+
+        -- Value label below box (positioned inside mainFrame area)
+        local valueLabel = new("TextLabel", {
+            Name = "Value",
+            Parent = UI._ScreenGui and UI._ScreenGui or playerGui, -- temporary placement; will be re-parented later
+            AnchorPoint = Vector2.new(0,0),
+            Position = UDim2.new(0, (PADDING + (i-1) * (BOX_PIXEL_SIZE + SPACING)), 0, BOX_PIXEL_SIZE + 2),
+            Size = UDim2.new(0, BOX_PIXEL_SIZE, 0, VALUE_LABEL_HEIGHT),
+            BackgroundTransparency = 1,
+            Text = tostring(def.max),
+            TextColor3 = Color3.new(1,1,1),
+            TextStrokeTransparency = 0.5,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            ZIndex = 3,
+        })
+
+        -- Save UI refs
+        UI[def.key] = { Box = box, Fill = fill, Icon = icon, IconGlow = iconGlow, ValueLabel = valueLabel, Stroke = stroke }
+    end
+
+    -- store screenGui reference
+    UI._ScreenGui = screenGui
+
+    -- Re-parent value labels to mainFrame for accurate positioning
+    for i,def in ipairs(UI) do
+        -- skip _ScreenGui entry
+    end
+
+    -- fix value label parents and positions now that mainFrame exists
+    for i,def in ipairs({"Health","Hunger","Stamina"}) do
+        local ui = UI[def]
+        if ui and ui.ValueLabel then
+            ui.ValueLabel.Parent = UI._ScreenGui.Main
+            ui.ValueLabel.Position = UDim2.new(0, (PADDING + (i-1) * (BOX_PIXEL_SIZE + SPACING)), 0, BOX_PIXEL_SIZE + 2)
+        end
+    end
 end
 
--- Key bindings for demo interactions (H, J, K, L) and LeftShift for stamina
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.UserInputType == Enum.UserInputType.Keyboard then
-		local key = input.KeyCode
-		if key == Enum.KeyCode.H then
-			-- take health damage demo
-			local stat = Stats.Health
-			local newv = math.max(0, stat.Value - 18)
-			tweenStatTo("Health", newv, 0.4)
-			-- if low, trigger visuals
-			stat.Value = newv
-			handleHealthVisual()
-		elseif key == Enum.KeyCode.J then
-			-- armor damage
-			local stat = Stats.Armor
-			local newv = math.max(0, stat.Value - 30)
-			tweenStatTo("Armor", newv, 0.25)
-			stat.Value = newv
-			flashArmorDamage(30)
-		elseif key == Enum.KeyCode.K then
-			local stat = Stats.Hunger
-			local newv = math.max(0, stat.Value - 12)
-			tweenStatTo("Hunger", newv, 0.3)
-			stat.Value = newv
-		elseif key == Enum.KeyCode.L then
-			local stat = Stats.Thirst
-			local newv = math.max(0, stat.Value - 15)
-			tweenStatTo("Thirst", newv, 0.3)
-			stat.Value = newv
-		elseif key == Enum.KeyCode.LeftShift then
-			startStaminaDrain()
-		end
-	end
-end)
+-- Initialize stats and UI
+local function initStats()
+    Stats.Health = { Value = healthSettings.Max, Max = healthSettings.Max }
+    Stats.Hunger = { Value = hungerSettings.Max, Max = hungerSettings.Max }
+    Stats.Stamina = { Value = stamina.Max, Max = stamina.Max }
 
-UserInputService.InputEnded:Connect(function(input, gameProcessed)
-	if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == Enum.KeyCode.LeftShift then
-		-- schedule regen after delay
-		scheduleStaminaRegen()
-	end
-end)
+    -- Build UI
+    buildHUD()
 
--- Connect stat NV changes to logic handlers
-for name,stat in pairs(Stats) do
-	stat.NV.Changed:Connect(function()
-		-- store the value for logic checks
-		stat.Value = stat.NV.Value
-		if name == "Health" then
-			handleHealthVisual()
-			-- health flashing when low (quick red pulse on icon)
-			if stat.Value <= stat.Max * 0.2 then
-				-- handled in handleHealthVisual
-			end
-		elseif name == "Armor" then
-			-- if armor just reached zero, run break effect
-			if stat.Value <= 0 then
-				flashArmorDamage(0)
-			end
-		end
-	end)
+    -- Initialize fills to current values
+    for name,stat in pairs(Stats) do
+        local ui = UI[name]
+        if ui then
+            ui.ValueLabel.Text = tostring(math.floor(stat.Value + 0.5))
+            local pct = stat.Value / stat.Max
+            ui.Fill.Size = UDim2.new(1,0,pct,0)
+        end
+    end
 end
 
--- Initialize visuals according to starting values
-for name,stat in pairs(Stats) do
-	stat.Value = stat.NV.Value
-	stat.UI.ValueLabel.Text = tostring(math.floor(stat.Value))
-	stat.UI.Stroke.Color = stat.Def.color
-	stat.UI.IconGlow.TextColor3 = stat.Def.color
+-- Smoothly tween fill to new percent (0..1)
+local function tweenFill(name, percent, duration)
+    duration = duration or 0.35
+    local ui = UI[name]
+    if not ui or not ui.Fill then return end
+    percent = math.clamp(percent, 0, 1)
+    -- We want the fill to shrink downwards. Fill frame is anchored to bottom: increasing height = more filled.
+    -- Animate Size.Y.Scale to percent
+    local info = TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(ui.Fill, info, { Size = UDim2.new(1,0,percent,0) })
+    tween:Play()
+    -- Smooth number update
+    local startVal = tonumber(ui.ValueLabel.Text) or 0
+    local targetVal = math.floor((Stats[name].Max * percent) + 0.5)
+    local diff = targetVal - startVal
+    if diff == 0 then return end
+    local steps = math.max(6, math.floor(duration * 60))
+    for i=1,steps do
+        delay((i-1)*(duration/steps), function()
+            local t = i/steps
+            local v = math.floor(startVal + diff * t + 0.5)
+            if ui and ui.ValueLabel then ui.ValueLabel.Text = tostring(v) end
+        end)
+    end
 end
 
--- Expose API to other scripts (setters)
-local module = {}
-module.setHealth = setHealth
-module.setArmor = setArmor
-module.setHunger = setHunger
-module.setThirst = setThirst
-module.setStamina = setStamina
--- Also expose a table to query current stats
-module.Stats = Stats
--- Attach module to the ScreenGui so other LocalScripts can require() it via GetAttribute or findfirstchild? 
--- Since LocalScripts can't be required directly via ScreenGui, we'll place a ModuleScript if you prefer. For now we put these functions on the ScreenGui attributes for simplicity.
-screenGui:SetAttribute("API_available", true)
--- For convenience, store functions on the GUI (callable via :Invoke on BindableFunction if needed)
--- But simplest: other local scripts can search for this ScreenGui and call these via BindableFunction or by sending RemoteEvents.
--- We'll create a BindableFunction for basic setting calls (local only)
-local binder = new("BindableFunction", { Name = "StatsAPICall", Parent = screenGui })
-binder.OnInvoke = function(action, value)
-	if action == "Health" then setHealth(value)
-	elseif action == "Armor" then setArmor(value)
-	elseif action == "Hunger" then setHunger(value)
-	elseif action == "Thirst" then setThirst(value)
-	elseif action == "Stamina" then setStamina(value)
-	else
-		warn("Unknown Stats API call:", action)
-	end
+-- Apply stat change functions
+local function setStat(name, newValue)
+    local stat = Stats[name]
+    if not stat then return end
+    newValue = math.clamp(newValue, 0, stat.Max)
+    stat.Value = newValue
+    -- update UI
+    local pct = stat.Value / stat.Max
+    tweenFill(name, pct, 0.25)
+    local ui = UI[name]
+    if ui and ui.ValueLabel then ui.ValueLabel.Text = tostring(math.floor(stat.Value + 0.5)) end
+    -- special: if health hits 0, attempt to kill player
+    if name == "Health" and stat.Value <= 0 then
+        local character = player.Character
+        if character then
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                humanoid.Health = 0
+            end
+        end
+    end
 end
 
--- Demo: brief tween to slightly pop in the HUD on spawn
-do
-	local origPos = mainFrame.Position
-	mainFrame.Position = mainFrame.Position + UDim2.new(0, 0, 0.05, 0)
-	local inTween = TweenService:Create(mainFrame, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = origPos })
-	inTween:Play()
+local function damageHealth(amount)
+    amount = math.abs(amount or 0)
+    local stat = Stats.Health
+    local newv = math.max(0, stat.Value - amount)
+    setStat("Health", newv)
+    lastDamageTime = tick()
 end
 
--- End of script. Use the provided API functions to integrate with your game's systems.
--- Example usage from another LocalScript (client-side):
--- local gui = Player.PlayerGui:WaitForChild("StatsHUD")
--- local binder = gui:FindFirstChild("StatsAPICall")
--- binder:Invoke("Health", 78) -- sets health to 78 smoothly
+local function healHealth(amount)
+    amount = math.abs(amount or 0)
+    local stat = Stats.Health
+    setStat("Health", stat.Value + amount)
+end
+
+local function setStaminaValue(v)
+    setStat("Stamina", v)
+end
+
+local function setHunger(v)
+    setStat("Hunger", v)
+end
+
+local function consumeFood(amount)
+    amount = math.abs(amount or 0)
+    local stat = Stats.Hunger
+    setStat("Hunger", math.min(stat.Max, stat.Value + amount))
+end
+
+-- Sprint control (external movement controller should call these via StatsAPICall)
+local staminaDrainConn
+local function startSprint()
+    if sprinting then return end
+    sprinting = true
+    -- cancel any regen scheduling
+    staminaRegenScheduled = false
+    -- start draining via Heartbeat
+    if staminaDrainConn then staminaDrainConn:Disconnect() end
+    local last = tick()
+    staminaDrainConn = RunService.Heartbeat:Connect(function()
+        local now = tick()
+        local dt = now - last
+        last = now
+        local stat = Stats.Stamina
+        local newv = math.max(0, stat.Value - stamina.DrainRate * dt)
+        setStaminaValue(newv)
+        -- low tint
+        if newv <= stat.Max * 0.15 then
+            local ui = UI.Stamina
+            if ui then
+                ui.Stroke.Color = Color3.fromRGB(255,165,0)
+                ui.IconGlow.TextColor3 = Color3.fromRGB(255,165,0)
+            end
+        end
+    end)
+end
+
+local function stopSprint()
+    if not sprinting then return end
+    sprinting = false
+    if staminaDrainConn then staminaDrainConn:Disconnect(); staminaDrainConn = nil end
+    -- schedule regen after delay
+    if not staminaRegenScheduled then
+        staminaRegenScheduled = true
+        delay(stamina.RegenDelay, function()
+            staminaRegenScheduled = false
+            -- regen loop
+            local last = tick()
+            local conn
+            conn = RunService.Heartbeat:Connect(function()
+                if sprinting then conn:Disconnect(); return end
+                local now = tick()
+                local dt = now - last
+                last = now
+                local stat = Stats.Stamina
+                if stat.Value >= stat.Max then
+                    -- restore visuals
+                    local ui = UI.Stamina
+                    if ui and ui.Stroke then ui.Stroke.Color = Color3.fromRGB(60,255,170); ui.IconGlow.TextColor3 = Color3.fromRGB(60,255,170) end
+                    conn:Disconnect(); return
+                end
+                local newv = math.min(stat.Max, stat.Value + stamina.RegenRate * dt)
+                setStaminaValue(newv)
+            end)
+        end)
+    end
+end
+
+-- Health regeneration when not damaged for a period
+local healthRegenConn
+local function startHealthRegenLoop()
+    if healthRegenConn then return end
+    healthRegenConn = RunService.Heartbeat:Connect(function(dt)
+        local stat = Stats.Health
+        if not stat then return end
+        local now = tick()
+        if stat.Value < stat.Max and (now - lastDamageTime) >= healthSettings.RegenDelay then
+            local newv = math.min(stat.Max, stat.Value + healthSettings.RegenRate * dt)
+            setStat("Health", newv)
+        end
+    end)
+end
+
+-- Hook into character to attempt to keep server/humanoid synced if possible
+local function onCharacterAdded(character)
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid:GetPropertyChangedSignal("Health"):Connect(function()
+            local h = humanoid.Health
+            if h ~= Stats.Health.Value then
+                setStat("Health", h)
+            end
+        end)
+    end
+end
+
+player.CharacterAdded:Connect(onCharacterAdded)
+if player.Character then onCharacterAdded(player.Character) end
+
+-- API BindableFunction for local scripts to call (Set, Damage, ConsumeFood, SprintStart/Stop, SetBoxSize, SetRates)
+local function setupAPI()
+    local gui = UI._ScreenGui
+    if not gui then return end
+    local binder = new("BindableFunction", { Name = "StatsAPICall", Parent = gui })
+    binder.OnInvoke = function(action, ...)
+        action = tostring(action or "")
+        if action == "Set" then
+            local name, value = ...
+            if Stats[name] then setStat(name, tonumber(value) or 0) end
+        elseif action == "Damage" then
+            local name, value = ...
+            if name == "Health" then damageHealth(tonumber(value) or 0) end
+        elseif action == "ConsumeFood" then
+            local amount = ...
+            consumeFood(tonumber(amount) or 0)
+        elseif action == "SprintStart" then
+            startSprint()
+        elseif action == "SprintStop" then
+            stopSprint()
+        elseif action == "SetBoxSize" then
+            local px = ...
+            px = tonumber(px)
+            if px and px >= 20 then
+                BOX_PIXEL_SIZE = px
+                buildHUD()
+                -- reinitialize labels/fills
+                for name,stat in pairs(Stats) do
+                    local ui = UI[name]
+                    if ui and ui.ValueLabel then ui.ValueLabel.Text = tostring(math.floor(stat.Value + 0.5)) end
+                    if ui and ui.Fill then ui.Fill.Size = UDim2.new(1,0, stat.Value / stat.Max, 0) end
+                end
+            end
+        elseif action == "SetRates" then
+            local t = ... -- expect table-like: { staminaDrain, staminaRegen, staminaRegenDelay, healthRegen, healthRegenDelay }
+            if type(t) == "table" then
+                stamina.DrainRate = tonumber(t.staminaDrain) or stamina.DrainRate
+                stamina.RegenRate = tonumber(t.staminaRegen) or stamina.RegenRate
+                stamina.RegenDelay = tonumber(t.staminaRegenDelay) or stamina.RegenDelay
+                healthSettings.RegenRate = tonumber(t.healthRegen) or healthSettings.RegenRate
+                healthSettings.RegenDelay = tonumber(t.healthRegenDelay) or healthSettings.RegenDelay
+            end
+        else
+            warn("Unknown StatsAPICall action:", action)
+        end
+    end
+end
+
+-- Start loops
+initStats()
+startHealthRegenLoop()
+setupAPI()
+
+-- Expose functions on the ScreenGui as attributes for convenience
+local gui = UI._ScreenGui
+if gui then
+    gui:SetAttribute("API_available", true)
+end
+
+-- End of script

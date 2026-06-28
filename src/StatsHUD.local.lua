@@ -345,7 +345,7 @@ local function stopSprint()
                     conn:Disconnect(); return
                 end
                 local newv = math.min(stat.Max, stat.Value + stamina.RegenRate * dt)
-                setStat("Stamina", newv)
+                setStaminaValue(newv)
             end)
         end)
     end

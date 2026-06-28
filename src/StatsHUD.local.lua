@@ -1,13 +1,11 @@
 -- StatsHUD.local.lua
--- Revised HUD per request:
---  - Removed demo bindings and removed Armor/Thirst (only Health, Stamina, Hunger remain)
---  - Smaller boxes by default; box size is editable via SetBoxSize(px)
---  - Stamina only drains while sprinting (use SprintStart/SprintStop). Walking does not drain stamina.
---  - Stamina regen delay and rate are editable via SetRates
---  - Health dies when it reaches 0 (sets Humanoid.Health = 0) and regenerates over time if not damaged; regen delay and rate are editable.
---  - Hunger only regenerates when consumeFood(amount) is called.
---  - Smooth downward-depleting fills implemented (Fill frames anchored to bottom). Tweens animate size smoothly.
---  - Public API via BindableFunction StatsAPICall: actions include Set, Damage, ConsumeFood, SprintStart/Stop, SetBoxSize, SetRates.
+-- Cleaned-up HUD: removed unused helper functions and no-op loop.
+-- Remaining behavior:
+--  - Health, Stamina, Hunger HUD with downward fills
+--  - Stamina drains only while sprinting (SprintStart/SprintStop)
+--  - Health regenerates after configurable delay when not damaged
+--  - Hunger only restores via ConsumeFood(amount)
+--  - Public API via BindableFunction StatsAPICall
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -200,11 +198,6 @@ local function buildHUD()
     -- store screenGui reference
     UI._ScreenGui = screenGui
 
-    -- Re-parent value labels to mainFrame for accurate positioning
-    for i,def in ipairs(UI) do
-        -- skip _ScreenGui entry
-    end
-
     -- fix value label parents and positions now that mainFrame exists
     for i,def in ipairs({"Health","Hunger","Stamina"}) do
         local ui = UI[def]
@@ -292,20 +285,7 @@ local function damageHealth(amount)
     lastDamageTime = tick()
 end
 
-local function healHealth(amount)
-    amount = math.abs(amount or 0)
-    local stat = Stats.Health
-    setStat("Health", stat.Value + amount)
-end
-
-local function setStaminaValue(v)
-    setStat("Stamina", v)
-end
-
-local function setHunger(v)
-    setStat("Hunger", v)
-end
-
+-- consumeFood restores hunger; no auto regen for hunger
 local function consumeFood(amount)
     amount = math.abs(amount or 0)
     local stat = Stats.Hunger
@@ -328,7 +308,7 @@ local function startSprint()
         last = now
         local stat = Stats.Stamina
         local newv = math.max(0, stat.Value - stamina.DrainRate * dt)
-        setStaminaValue(newv)
+        setStat("Stamina", newv)
         -- low tint
         if newv <= stat.Max * 0.15 then
             local ui = UI.Stamina
@@ -365,7 +345,7 @@ local function stopSprint()
                     conn:Disconnect(); return
                 end
                 local newv = math.min(stat.Max, stat.Value + stamina.RegenRate * dt)
-                setStaminaValue(newv)
+                setStat("Stamina", newv)
             end)
         end)
     end
